@@ -460,56 +460,95 @@ find "$patient_dir" -type d -empty -mindepth 2 -maxdepth 2 ! -name "09_患者补
 
 最终 `find $patient_dir -type d` 出来的目录树应该**只反映这位患者实际有的桶**，不是骨架模板。
 
-### 4.9 ★ Canonical record naming（record_namer 工程化命名）
+### 4.9 ★ Canonical record naming（你的判断，不是脚本）
 
-Layer 2 §4.6 把所有 OCR sidecar 写完之后，**全量**调一次 `record_namer.py`，从池子里的 OCR 文本生成稳定 rename plan。这是 PRD §6.B 文件命名规则 `日期_类型_机构.<ext>` 的**唯一**工程执行点（不靠 prompt 拼字符串）。
+§4.6 把每个文件都按原始 basename 复制到对应子桶 + 写完 OCR sidecar 之后，**你**像档案管理员一样逐份读 sidecar，建一个 rename plan。这是判断任务，不是 regex 任务——硬编码 cancer 列表 / doc_type 模式 / 医院 regex 在真实病历上泛化得很差（真实医院名字千变万化，真实癌种亚型 regex 抓不全）。语义判断由你做。
 
-```bash
-python3 "$skill_dir/scripts/record_namer.py" \
-    --plan-from /tmp/cb-local-classification.jsonl \
-    --current-dir "$patient_dir" \
-    > "$patient_dir/.rename_plan.json"
+每个分类后文件，从对应的 `ocr/*.md` sidecar 里判断四个字段：
+
+| 字段 | 怎么判 |
+|---|---|
+| `date` | 报告里的出具日期（检验日期 / 报告日期 / 出院日期 / 手术日期）。`YYYY-MM-DD`。sidecar 里完全没日期就 fallback 到 `stat -f %Sm -t %Y-%m-%d "$file"`（文件 mtime）。还是没有就 `UNKNOWN-DATE`。 |
+| `doc_type` | 报告自称的中文术语，越具体越好。例：`病理报告`, `基因检测`, `出院小结`, `CT`, `PET-CT`, `MRI`, `血常规`, `肿瘤标志物`, `手术记录`, `化疗记录`, `会诊意见`。不要发明新词；引用文档自己写的。实在读不出再 fallback 到 subbucket 名。 |
+| `org` | 出具机构，按 PRD §6.B 优先级：(1) 报告正文里的正式机构名（例 `中山大学附属第六医院`, `华大基因`, `燃石医学`）；(2) 原始文件名里的机构串；(3) caller 给的 task_default；(4) `unknown-org`。剥掉不属于正式机构名的尾巴（科室、地址、电话）。 |
+| `page` | 多页同一份报告里的页号（sidecar 含 `第 3 / 8 页`）。否则 null。 |
+
+跨 sidecar 综合判断两个 patient 级字段：
+
+| 字段 | 怎么判 |
+|---|---|
+| `cancer_label` | 患者主癌种，2-6 个汉字，按 PRD 例子风格：`宫颈癌`, `乳腺癌`, `肺腺癌`, `结直肠癌`, `胆管癌`, `胆囊腺癌` 等。组织学影响治疗选择时用具体亚型（`肺腺癌` vs `肺鳞癌`），但保持简短。多份 sidecar 不一致时优先最新的病理 / 基因报告；仍模糊或缺失就 null。 |
+| `first_dx_date` | 病理报告 / 出院小结里提到诊断的最早可解析日期。没有就最早的报告日期。完全没有就 null。 |
+
+把 plan 写成 `<patient_dir>/.rename_plan.json`（用 Write 工具写，不调脚本）：
+
+```json
+{
+  "patient_dir_rename": {
+    "cancer_label": "宫颈癌 | null",
+    "first_dx_yyyymm": "2024-03 | null",
+    "proposed": "宫颈癌_2024-03_<hash4>",
+    "fallback_used": false
+  },
+  "file_renames": [
+    {
+      "original_path": "<abs>",
+      "new_basename": "<YYYY-MM-DD>_<doc_type>_<org>[_p<n>].<ext>",
+      "sidecar_old": "ocr/<old>.md",
+      "sidecar_new": "ocr/<new>.md",
+      "extracted": {"date": "...", "doc_type": "...", "org": "...", "page": null}
+    }
+  ]
+}
 ```
 
-输入是 §4.6 累积的 `/tmp/cb-local-classification.jsonl`（每行一个分类后文件 + OCR 文本）。输出 JSON 详见 [`../scripts/record_namer.py`](../scripts/record_namer.py) 顶部 docstring：
+`<hash4>` = `shasum -a 256` 取前 4 hex of `<patient_dir 绝对路径> + cancer_label + first_dx_yyyymm`——同样 input 跨次运行 hash 一致。
 
-- `patient_dir_rename`: `{cancer_label, first_dx_yyyymm, hash4, proposed: "<cancer>_<YYYY-MM>_<hash4>", fallback_used}` — §4.11 用
-- `file_renames[]`: 每条含 `original_path`, `new_basename`（`<YYYY-MM-DD>_<doc_type>_<机构>.<ext>` 格式）, `sidecar_rename`, `audit` (date/org/doc_type 来源审计)
-- `ref_backfill.manifest_old_to_new` / `sidecar_old_to_new`: §4.10 用
+判不出 `cancer_label` 或 `first_dx_date` 时 `fallback_used: true`、`proposed: null`，§4.11 保留 bootstrap `PT-<hex>`。**永远不要**为了凑命名编造癌种。
 
-`机构` 提取优先级（PRD §6.B）：ocr_body → filename → task_default → `unknown-org`。缺日期 fallback 到 mtime 或 `UNKNOWN-DATE`。冲突自动 `_2`/`_3` 后缀。
+### 4.10 ★ 原子重命名 + 引用回填（机械执行）
 
-### 4.10 ★ 原子重命名 + 引用回填
-
-按 `.rename_plan.json` 的 `file_renames[]` 执行：
+按 `.rename_plan.json` 的 `file_renames[]` 执行 — 这部分没判断，纯 bash 搬字节：
 
 ```bash
-jq -c '.file_renames[]' "$patient_dir/.rename_plan.json" | while read entry; do
-    op=$(echo "$entry" | jq -r '.original_path')
-    np=$(echo "$entry" | jq -r '.new_path')
-    [ "$op" != "$np" ] && [ ! -e "$np" ] && mv "$op" "$np"
-    sc_old=$(echo "$entry" | jq -r '.sidecar_rename.old // empty')
-    sc_new=$(echo "$entry" | jq -r '.sidecar_rename.new // empty')
-    [ -n "$sc_old" ] && [ -n "$sc_new" ] && [ "$sc_old" != "$sc_new" ] && [ ! -e "$sc_new" ] && mv "$sc_old" "$sc_new"
-done
+sanitize() { printf '%s' "$1" | tr -d '\000-\037' | tr '/\\<>:"|?*' '-'; }
+
+while IFS= read -r entry; do
+    op=$(jq -r '.original_path' <<<"$entry")
+    nb=$(sanitize "$(jq -r '.new_basename' <<<"$entry")")
+    np="$(dirname "$op")/$nb"
+    # collision: 目标存在且不是自己 → _2 / _3 ...
+    if [ -e "$np" ] && [ "$op" != "$np" ]; then
+        i=2; stem="${nb%.*}"; ext="${nb##*.}"
+        while [ -e "$(dirname "$op")/${stem}_${i}.${ext}" ]; do i=$((i+1)); done
+        np="$(dirname "$op")/${stem}_${i}.${ext}"
+    fi
+    [ "$op" != "$np" ] && mv -n "$op" "$np"
+
+    sc_old=$(jq -r '.sidecar_old // empty' <<<"$entry")
+    sc_new=$(jq -r '.sidecar_new // empty' <<<"$entry")
+    if [ -n "$sc_old" ] && [ -n "$sc_new" ] && [ -f "$patient_dir/$sc_old" ]; then
+        mv -n "$patient_dir/$sc_old" "$patient_dir/$sc_new"
+    fi
+done < <(jq -c '.file_renames[]' "$patient_dir/.rename_plan.json")
 ```
 
 回填引用：
 
-- `source_manifest.tsv`（若已存在）：用 `ref_backfill.manifest_old_to_new` 改写 path 列；保留 `original_basename` 列作审计追溯
-- `_FILENAME_MAPPING.md`（§4.7）：每行的"规范化文件名"列改为 `.rename_plan.json` 的 `new_basename`
-- 各 `ocr/*.md` 内部的 `SOURCE:` header：旧 basename → 新 basename
+- `source_manifest.tsv`（若已存在）：path 列改写为 canonical basename；保留 `original_basename` 列作审计追溯
+- `_FILENAME_MAPPING.md`（§4.7）：每行的"规范化文件名"列改为 plan 的 `new_basename`
+- 每个被改名的 `ocr/*.md` 内部 `SOURCE:` header：旧 basename → 新 basename
 - `10_原始文件/原始未遮挡/` 字节级镜像**不动**（保留原始 basename）
 
-**Idempotency**：若 `original_path == new_path` 跳过 `mv`；目标已存在且不是自己也跳过（让 §4.9 的 collision_suffix 处理）。
+**Idempotency**：`mv -n` 拒绝覆盖。文件已经是 canonical 名就 no-op。
 
 ### 4.11 ★ patient_dir 自身命名
 
-读 `.rename_plan.json` 的 `patient_dir_rename`。`fallback_used: false` 时：
+`fallback_used: false` 且 `proposed` 非空时：
 
 ```bash
 PROPOSED=$(jq -r '.patient_dir_rename.proposed' "$patient_dir/.rename_plan.json")
-NEW_DIR="$(dirname $patient_dir)/$PROPOSED"
+NEW_DIR="$(dirname "$patient_dir")/$PROPOSED"
 if [ "$patient_dir" != "$NEW_DIR" ] && [ ! -e "$NEW_DIR" ]; then
     mv "$patient_dir" "$NEW_DIR"
     patient_dir="$NEW_DIR"
@@ -518,7 +557,7 @@ fi
 
 `fallback_used: true`（OCR 没读出可识癌种或日期）→ 保留 bootstrap 的 `PT-<hex>`，**不**做半残命名。
 
-结果：OCR 信号足时 patient_dir 是 `<cancer>_<YYYY-MM>_<hash4>`（例 `宫颈癌_2024-03_4f2a`）——可读但无 PII；信号不足时 fallback 到 `PT-<hex>`。
+结果：OCR 信号足时 patient_dir 是 `<cancer>_<YYYY-MM>_<hash4>`（例 `宫颈癌_2024-03_4f2a`）——可读但无 PII；信号不足时 fallback 到 `PT-<hex>`。两个状态都是合法终态。
 
 ## Step 5 — Layer 3: 临床综合 + 6 类审计
 

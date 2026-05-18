@@ -17,10 +17,12 @@ Turn raw patient files into a canonical patient directory with **clinical-grade 
 Layer 1: 本地 PaddleOCR → ocr/<basename>.md (字符 + 双层 PII 脱敏)
 Layer 2: Claude vision  → 11 桶 + 子桶分类 + 去重 + 字符校正补救
                        + 复制时保留原始 basename（命名不在 Layer 2 做）
-Layer 2.5: record_namer.py → canonical filenames per PRD §6.B
-                       <YYYY-MM-DD>_<doc_type>_<机构>.<ext>
+Layer 2.5: 你 (LLM) 判断  → 每文件 {date, doc_type, 机构, page}
+                       + 患者级 {cancer_label, first_dx_date}
+                       → 写 .rename_plan.json (semantic, 不用 regex)
+Layer 2.6: bash 机械执行  → 原子 mv + 冲突后缀 + manifest / sidecar SOURCE
+                       / _FILENAME_MAPPING 全量回填
                        + patient_dir → <cancer>_<YYYY-MM>_<hash4>
-Layer 2.6: 原子重命名 + manifest / sidecar SOURCE / _FILENAME_MAPPING 全量回填
 Layer 3: Claude text    → profile.json (schema_v1) + timeline.md (临床事件) + 6 类 review_flags
 Layer 3.5: 患者补充 merge → 09_患者补充/ 进 patient_curated 标签
 ```
@@ -216,8 +218,7 @@ Subagent 跑完返回 pure JSON：
 - [references/ocr-sidecar-template.md](references/ocr-sidecar-template.md) — Layer 1+2 sidecar schema
 - [references/review-flags-categories.md](references/review-flags-categories.md) — 6 类审计规则
 - [references/paddleocr-integration.md](references/paddleocr-integration.md) — subprocess + venv + fallback
-- [references/organizer-prompt.md](references/organizer-prompt.md) — subagent 主提示词（Phase 3 写入）
-- [scripts/record_namer.py](scripts/record_namer.py) — canonical 命名引擎（PRD §6.B 文件名 + `<cancer>_<YYYY-MM>_<hash4>` patient_dir，与主仓字节级一致）
+- [references/organizer-prompt.md](references/organizer-prompt.md) — subagent 主提示词（含 Layer 2.5/2.6 canonical 命名）
 - [../../references/profile-card.md](../../references/profile-card.md) — Patient Profile Card 模板（与 cancer-buddy-organize 共享）
 - [../../references/patient-profile-schema.md](../../references/patient-profile-schema.md) — schema_v1 contract（与 cancer-buddy-skill 主仓双向同步）
 - [../../references/safety-guardrails.md](../../references/safety-guardrails.md) — 安全红线（与 cancer-buddy-skill 主仓双向同步）
